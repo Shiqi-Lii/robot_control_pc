@@ -1,0 +1,112 @@
+policy_host: 172.22.1.127
+policy_port: 5555
+timeout_ms: 15000           # 通信时的超时时间
+control_fps: 30.0           # 机器人执行动作的目标频率
+open_loop_horizon: 16       # 决定每次从 server 返回的 action chunk 里，实际执行多少步
+action_refill_threshold: 6  # 动作队列低于该值时立即向 server 拉取新 chunk
+max_steps: 0                # 控制程序最多执行多少个动作步，0 表示不设上限，一直跑
+
+reset_on_start: true        # 是否在启动时调用 robot.reset()
+reset_duration_s: 4.0       # reset 的时间
+# reset_left_joint_positions:  [-0.2, 0.0, -0.2, -1.0, 0, -0.4, 0] # 机器人初始位置
+reset_left_joint_positions:  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # 机器人初始位置
+
+# reset_right_joint_positions: [0, 0, 0, 0, 0, 0, 0]
+
+point_time_from_start: 0.5 # 每次发出去的轨迹点都告诉控制器几秒到达
+
+# 在这里加 指令
+language_instruction: show the left hand in front of the body
+# language_instruction: use the left hand to push the water cup
+
+
+camera_keys:
+  - top
+  # - wrist
+
+state_keys:
+  - left_arm
+  # - left_arm_velocity
+  # - right_arm
+  # - right_arm_velocity
+  # - left_gripper
+  # - right_gripper
+  # - left_ee_pose
+  # - right_ee_pose
+
+action_keys:
+  - left_arm
+  # - right_arm
+  # - left_gripper
+  # - right_gripper
+  # - delta_left_ee_pose
+  # - delta_right_ee_pose
+
+
+# 读取状态相关
+joint_state_topic: /joint_states
+
+left_joint_names:
+  - left_joint1
+  - left_joint2
+  - left_joint3
+  - left_joint4
+  - left_joint5
+  - left_joint6
+  - left_joint7
+
+right_joint_names:
+  - right_joint1
+  - right_joint2
+  - right_joint3
+  - right_joint4
+  - right_joint5
+  - right_joint6
+  - right_joint7
+
+gripper_state_enabled: true
+gripper_state_topic: /robot/api/io/state
+gripper_left_key: an_out_d9710
+gripper_right_key: an_out_d9711
+gripper_open_value: 2
+gripper_closed_value: 1
+gripper_default_value: 0.5
+
+left_ee_pose_enabled: true
+left_ee_pose_topic: /planner/left_tcp_pose
+right_ee_pose_enabled: true
+right_ee_pose_topic: /planner/right_tcp_pose
+
+observation_timeout_s: 3.0
+
+camera_topics:
+  top: /top/image_raw
+  # wrist: /top/image_raw
+camera_timeout_s: 3.0
+
+
+# 动作控制相关
+left_trajectory_topic: /arm_left_controller/joint_trajectory
+right_trajectory_topic: /arm_right_controller/joint_trajectory
+
+# 末端增量控制（仅当 action_keys 中包含 delta_left_ee_pose / delta_right_ee_pose 时生效）
+left_delta_twist_topic: /left_servo_node/delta_twist_cmds
+right_delta_twist_topic: /right_servo_node/delta_twist_cmds
+left_start_servo_service: /left_servo_node/start_servo
+right_start_servo_service: /right_servo_node/start_servo
+auto_start_servo_for_ee_delta: true
+ee_delta_frame_id: base_link
+ee_delta_source_hz: 30.0
+ee_delta_gain: 5.0
+ee_delta_command_in_type: unitless  # unitless 或 speed_units
+ee_delta_unitless_linear_scale: 1.0
+ee_delta_unitless_rotational_scale: 1.0
+
+
+
+gripper_cmd_enabled: true
+gripper_cmd_topic: /plc/io/cmd
+gripper_left_cmd_key: an_out_clamp
+gripper_right_cmd_key: an_out_clamp_r
+
+language_key: annotation.human.task_description
