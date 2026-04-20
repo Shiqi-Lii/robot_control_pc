@@ -72,8 +72,11 @@ class RuntimeConfig:
     policy_port: int = 5555
     timeout_ms: int = 15000
     control_fps: float = 30.0
+    execution_mode: str = "async_queue"
     open_loop_horizon: int = 8
     action_refill_threshold: int = 2  # Refill chunk when queued actions <= this value
+    rtc_overlap: int = 8
+    rtc_frozen: int = 4
     max_steps: int = 0
     language_instruction: str = "pick up the object"
     reset_on_start: bool = False
@@ -286,7 +289,7 @@ class Gr00tRobotControlClient:
     def _start_async_prefetch(
         self,
         policy_observation: dict[str, Any],
-        queued_actions: list[dict[str, Any]],
+        queued_actions: list[dict[str, Any]] | None = None,
     ) -> None:
         with self._prefetch_lock:
             if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
@@ -294,16 +297,19 @@ class Gr00tRobotControlClient:
             self._prefetch_actions = None
             self._prefetch_error = None
 
-        projected_observation = self._project_future_state_observation(
-            policy_observation,
-            queued_actions,
-        )
+        if queued_actions:
+            request_observation = self._project_future_state_observation(
+                policy_observation,
+                queued_actions,
+            )
+        else:
+            request_observation = policy_observation
 
         def _worker() -> None:
             worker_policy = self._make_policy_client()
             try:
                 actions = self._fetch_action_chunk(
-                    projected_observation,
+                    request_observation,
                     policy=worker_policy,
                     log_prefix="[async] ",
                 )
@@ -336,6 +342,153 @@ class Gr00tRobotControlClient:
             raise RuntimeError("Asynchronous action prefetch failed") from error
         return actions
 
+    def _wait_async_prefetch(self) -> list[dict[str, Any]] | None:
+        with self._prefetch_lock:
+            thread = self._prefetch_thread
+        if thread is None:
+            return None
+        thread.join()
+        return self._collect_async_prefetch()
+
+    def _run_async_queue_loop(self) -> None:
+        step = 0
+        target_period = 1.0 / max(self.runtime.control_fps, 1e-6)
+        action_queue: deque[dict[str, Any]] = deque()
+        last_action: dict[str, Any] | None = None
+        refill_threshold = max(
+            0,
+            min(self.runtime.action_refill_threshold, max(self.runtime.open_loop_horizon - 1, 0)),
+        )
+
+        first_obs = self._read_current_observation()
+        first_policy_observation = self.build_policy_observation(first_obs)
+        first_actions = self._fetch_action_chunk(first_policy_observation)
+        for action in first_actions[: self.runtime.open_loop_horizon]:
+            action_queue.append(action)
+        if not action_queue:
+            raise RuntimeError("Policy returned empty action chunk.")
+
+        seed_obs = self._read_current_observation()
+        seed_policy_observation = self.build_policy_observation(seed_obs)
+        self._start_async_prefetch(seed_policy_observation, list(action_queue))
+
+        while self.runtime.max_steps <= 0 or step < self.runtime.max_steps:
+            tic = time.time()
+
+            prefetched_actions = self._collect_async_prefetch()
+            if prefetched_actions:
+                for action in prefetched_actions[: self.runtime.open_loop_horizon]:
+                    action_queue.append(action)
+
+            if len(action_queue) <= refill_threshold:
+                with self._prefetch_lock:
+                    inflight = self._prefetch_thread is not None and self._prefetch_thread.is_alive()
+                if not inflight:
+                    obs = self._read_current_observation()
+                    policy_observation = self.build_policy_observation(obs)
+                    self._start_async_prefetch(policy_observation, list(action_queue))
+
+            if action_queue:
+                action = action_queue.popleft()
+                last_action = action
+                print(f"Executing action[{step}]: {_format_mapping(action)}")
+                self.robot.send_action(action)
+                step += 1
+            elif last_action is not None:
+                print(f"Executing hold action[{step}]: {_format_mapping(last_action)}")
+                self.robot.send_action(last_action)
+                step += 1
+            else:
+                raise RuntimeError("No action available to execute.")
+
+            if 0 < self.runtime.max_steps <= step:
+                break
+
+            elapsed = time.time() - tic
+            if elapsed < target_period:
+                time.sleep(target_period - elapsed)
+
+    def _run_rtc_loop(self) -> None:
+        step = 0
+        target_period = 1.0 / max(self.runtime.control_fps, 1e-6)
+
+        first_obs = self._read_current_observation()
+        first_policy_observation = self.build_policy_observation(first_obs)
+        current_actions = self._fetch_action_chunk(first_policy_observation)[: self.runtime.open_loop_horizon]
+        if not current_actions:
+            raise RuntimeError("Policy returned empty action chunk.")
+
+        while self.runtime.max_steps <= 0 or step < self.runtime.max_steps:
+            action_horizon = len(current_actions)
+            if action_horizon < 1:
+                raise RuntimeError("Current action chunk is empty.")
+            if action_horizon < 32:
+                print(f"Warning: RTC works best with action horizon >= 32, got {action_horizon}.")
+
+            overlap = min(max(self.runtime.rtc_overlap, 0), max(action_horizon - 1, 0))
+            frozen = min(max(self.runtime.rtc_frozen, 0), overlap)
+            prefetch_start_idx = max(action_horizon - overlap - 1, 0)
+            swap_idx = max(action_horizon - frozen - 1, 0)
+            swapped = False
+
+            print(
+                "RTC chunk ready: "
+                f"horizon={action_horizon}, "
+                f"prefetch_idx={prefetch_start_idx}, "
+                f"swap_idx={swap_idx}, "
+                f"overlap={overlap}, frozen={frozen}"
+            )
+
+            for action_idx, action in enumerate(current_actions):
+                tic = time.time()
+
+                if action_idx == prefetch_start_idx:
+                    obs = self._read_current_observation()
+                    policy_observation = self.build_policy_observation(obs)
+                    print(
+                        f"RTC prefetch triggered at local_idx={action_idx}, "
+                        f"global_step={step}"
+                    )
+                    self._start_async_prefetch(policy_observation)
+
+                print(f"Executing action[{step}]: {_format_mapping(action)}")
+                self.robot.send_action(action)
+                step += 1
+
+                if 0 < self.runtime.max_steps <= step:
+                    break
+
+                if action_idx == swap_idx and action_idx < action_horizon - 1:
+                    prefetched_actions = self._wait_async_prefetch()
+                    if prefetched_actions is None:
+                        raise RuntimeError("RTC swap point reached before next chunk was ready.")
+                    current_actions = prefetched_actions[: self.runtime.open_loop_horizon]
+                    if not current_actions:
+                        raise RuntimeError("RTC fetched an empty next action chunk.")
+                    print(
+                        "RTC swap completed: "
+                        f"discarded old tail after local_idx={action_idx}, "
+                        f"loaded next chunk length={len(current_actions)}"
+                    )
+                    swapped = True
+                    break
+
+                elapsed = time.time() - tic
+                if elapsed < target_period:
+                    time.sleep(target_period - elapsed)
+
+            if 0 < self.runtime.max_steps <= step:
+                break
+
+            if swapped:
+                continue
+
+            obs = self._read_current_observation()
+            policy_observation = self.build_policy_observation(obs)
+            current_actions = self._fetch_action_chunk(policy_observation)[: self.runtime.open_loop_horizon]
+            if not current_actions:
+                raise RuntimeError("Policy returned empty action chunk.")
+
     def run(self) -> None:
         print("Connecting to robot controller...")
         self.robot.connect()
@@ -354,67 +507,15 @@ class Gr00tRobotControlClient:
                 f"Cannot reach GR00T server at {self.runtime.policy_host}:{self.runtime.policy_port}"
             )
         print("GR00T server is reachable. Entering control loop.")
-
-        step = 0
-        target_period = 1.0 / max(self.runtime.control_fps, 1e-6)
-        action_queue: deque[dict[str, Any]] = deque()
-        last_action: dict[str, Any] | None = None
-        refill_threshold = max(
-            0,
-            min(self.runtime.action_refill_threshold, max(self.runtime.open_loop_horizon - 1, 0)),
-        )
-
         try:
-            # Prime buffers and first chunk
-            first_obs = self._read_current_observation()
-            first_policy_observation = self.build_policy_observation(first_obs)
-            first_actions = self._fetch_action_chunk(first_policy_observation)
-            for action in first_actions[: self.runtime.open_loop_horizon]:
-                action_queue.append(action)
-            if not action_queue:
-                raise RuntimeError("Policy returned empty action chunk.")
-
-            # Start prefetching the next chunk immediately, using queued actions to
-            # approximate the future state at which the next chunk will start.
-            seed_obs = self._read_current_observation()
-            seed_policy_observation = self.build_policy_observation(seed_obs)
-            self._start_async_prefetch(seed_policy_observation, list(action_queue))
-
-            while self.runtime.max_steps <= 0 or step < self.runtime.max_steps:
-                tic = time.time()
-
-                prefetched_actions = self._collect_async_prefetch()
-                if prefetched_actions:
-                    for action in prefetched_actions[: self.runtime.open_loop_horizon]:
-                        action_queue.append(action)
-
-                if len(action_queue) <= refill_threshold:
-                    with self._prefetch_lock:
-                        inflight = self._prefetch_thread is not None and self._prefetch_thread.is_alive()
-                    if not inflight:
-                        obs = self._read_current_observation()
-                        policy_observation = self.build_policy_observation(obs)
-                        self._start_async_prefetch(policy_observation, list(action_queue))
-
-                if action_queue:
-                    action = action_queue.popleft()
-                    last_action = action
-                    print(f"Executing action[{step}]: {_format_mapping(action)}")
-                    self.robot.send_action(action)
-                    step += 1
-                elif last_action is not None:
-                    # Graceful fallback while waiting for the next async chunk.
-                    print(f"Executing hold action[{step}]: {_format_mapping(last_action)}")
-                    self.robot.send_action(last_action)
-                    step += 1
-                else:
-                    raise RuntimeError("No action available to execute.")
-
-                if 0 < self.runtime.max_steps <= step:
-                    break
-
-                elapsed = time.time() - tic
-                if elapsed < target_period:
-                    time.sleep(target_period - elapsed)
+            if self.runtime.execution_mode == "async_queue":
+                self._run_async_queue_loop()
+            elif self.runtime.execution_mode == "rtc":
+                self._run_rtc_loop()
+            else:
+                raise ValueError(
+                    "Unsupported execution_mode "
+                    f"'{self.runtime.execution_mode}'. Use 'async_queue' or 'rtc'."
+                )
         finally:
             self.robot.disconnect()

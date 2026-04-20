@@ -1,237 +1,204 @@
-# VLASH-Style Control Loop
+# RTC-Style Control Loop
 
-本文档说明 [core.py](/home/f/Isaac-GR00T/robot_control_pc/core.py) 当前采用的控制思路。它不是对 `mit-han-lab/vlash` 的完整复现，而是一个面向现有 GR00T server-client 架构的简化实现，核心借鉴了两点：
+本文档保留的是一版 RTC / VLASH 风格控制思路说明，用来记录曾尝试的方向。
 
-- 异步预取下一段 action chunk
-- 用待执行动作对下一次推理输入做 future-state-aware 近似前滚
+当前 [core.py](/home/f/Isaac-GR00T/robot_control_pc/core.py) 已经切回较稳定的“异步预取 + 动作队列补货”实现，不再使用本文件里描述的 `overlap / frozen` 切换逻辑。
 
-## 目标
+如果后续需要再次切回 RTC 风格，可以把这份文档作为设计参考。
 
-相较于传统同步控制：
+## 核心思路
 
-1. 读当前观测
-2. 阻塞等待 `get_action()`
-3. 执行动作
-4. 再读观测
+当前实现把动作预测看成“重叠区补全”问题：
 
-当前实现希望达到：
+1. 当前 chunk 正在执行时，不等它跑完，就提前触发下一次推理
+2. 新 chunk 与旧 chunk 在尾部保留一个重叠区
+3. 在真正切换时：
+   - `frozen` 这部分保持旧 chunk 的尾部不变
+   - 剩余重叠区做软融合
 
-- 执行动作时，后台同时向 server 预取下一段动作
-- 减少因为推理阻塞造成的动作停顿
-- 在发起下一次推理时，尽量考虑“机器人在推理完成前还会继续执行旧动作”这一事实
+这样可以减少 chunk 边界处的动作突变。
 
-## 整体结构
+## 关键参数
 
-主流程位于 [Gr00tRobotControlClient.run()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L339)。
+参数来自 [example_config.yaml](/home/f/Isaac-GR00T/robot_control_pc/config/example_config.yaml)：
 
-控制循环涉及 5 个核心模块：
+- `open_loop_horizon`
+  - 当前每段 chunk 实际使用的长度
+  - RTC 推荐至少 `32`
+- `rtc_overlap`
+  - 相邻 chunk 的重叠长度
+- `rtc_frozen`
+  - 切换时保留旧 chunk 尾部、不被新 chunk 覆盖的步数
+- `control_fps`
+  - 动作执行频率
+- `point_time_from_start`
+  - 单个 `JointTrajectoryPoint` 的目标到达时间
 
-- [TemporalBuffer](/home/f/Isaac-GR00T/robot_control_pc/core.py#L33)
-- [build_policy_observation()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L182)
-- [decode_action_chunk()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L201)
-- [_start_async_prefetch()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L286)
-- [_project_future_state_observation()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L255)
+默认配置是：
 
-## 执行流程
+- `open_loop_horizon: 32`
+- `rtc_overlap: 8`
+- `rtc_frozen: 4`
 
-### 1. 启动阶段
+## 运行流程
 
-启动后先完成：
+主逻辑在 [run()]( /home/f/Isaac-GR00T/robot_control_pc/core.py#L399 )。
 
-- 连接机器人接口
-- 根据配置决定是否 reset
-- `ping` GR00T server
-- 查询 `get_modality_config()`
-- 根据 `delta_indices` 推断 observation 的时序长度
+### 1. 首次同步推理
 
-其中时序长度自动来自：
+启动后先：
 
-- `video.delta_indices`
-- `state.delta_indices`
+1. 连接机器人
+2. 可选 `reset`
+3. `ping` GR00T server
+4. 读取第一帧 observation
+5. 同步调用一次 `get_action()`
 
-## 2. 首次同步拉取 action chunk
+第一段动作会被截取为：
 
-进入主循环前，会先做一次同步推理：
+- `current_actions = actions[:open_loop_horizon]`
 
-1. 读取当前 observation
-2. 用 [build_policy_observation()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L182) 打包成 `(B, T, ...)`
-3. 调 [_fetch_action_chunk()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L221)
-4. 用 [decode_action_chunk()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L201) 把 `(B, T, D)` 形式的 action 拆成逐步动作列表
-5. 把前 `open_loop_horizon` 步放入本地 `action_queue`
+## 2. 逐步执行当前 chunk
 
-这样做的目的是先让本地队列里有一段可执行动作，再进入实时循环。
+当前 chunk 按索引 `action_idx` 一步一步执行。
 
-## 3. 动作队列
+每步会：
 
-`action_queue` 是当前控制循环的核心状态。
+1. 如果到了预取触发点，就异步拉下一段 chunk
+2. 发送当前动作到机器人
+3. 用 `control_fps` 补齐节拍
 
-它保存“已经从 server 拿到，但还没真正发给机器人”的动作序列。主循环中每个控制周期只做一件事：
+## 3. 预取触发点
 
-- 从队列头部取一条动作
-- 调 `self.robot.send_action(action)` 下发到机器人
+预取触发点按下面公式确定：
 
-好处是：
+- `prefetch_start_idx = action_horizon - overlap - 1`
 
-- 动作执行节拍可以和推理解耦
-- server 一次返回多步动作时，本地可以连续执行
-- 即便下一段 chunk 还没回来，也不必马上停下
+也就是在旧 chunk 还剩 `overlap` 步时，后台线程开始推理下一段动作。
 
-## 4. 异步预取下一段动作
+异步预取实现位于：
 
-当前实现通过 [\_start_async_prefetch()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L286) 在后台线程中创建新的 `PolicyClient`，并调用 `get_action()`。
+- [\_start_async_prefetch()]( /home/f/Isaac-GR00T/robot_control_pc/core.py#L342 )
 
-它的行为是：
+后台线程会：
 
-1. 主线程继续按 `control_fps` 执行动作队列
-2. 后台线程独立向 server 请求下一段 action chunk
-3. 后台完成后，把结果放到：
-   - `self._prefetch_actions`
-   - 或 `self._prefetch_error`
-4. 主线程在下一轮循环里用 [\_collect_async_prefetch()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L321) 收取结果
+1. 读取当前观测的 policy 格式
+2. 对 state 做轻量 future-state-aware 前滚
+3. 调用新的 `PolicyClient.get_action()`
+4. 把结果暂存到 `_prefetch_actions`
 
-这就是当前实现里最接近 VLASH “async inference” 的部分。
+## 4. Future-State-Aware 前滚
 
-## 5. Future-State-Aware 近似前滚
-
-后台预取下一段动作时，直接用“当前时刻 observation”去推理会有时间错位问题：
-
-- 推理需要时间
-- 推理期间机器人仍在继续执行旧动作
-- 所以下一段动作真正开始执行时，机器人状态已经不是发起推理时的状态
-
-当前实现用 [\_project_future_state_observation()](/home/f/Isaac-GR00T/robot_control_pc/core.py#L255) 做了一个简化近似：
+为了减少推理时延带来的状态错位，当前实现没有直接用“当前 observation”去推下一段，而是用 [\_project_future_state_observation()]( /home/f/Isaac-GR00T/robot_control_pc/core.py#L311 ) 对 state 做了一个近似前滚：
 
 1. 复制当前 `policy_observation["state"]`
-2. 取 `queued_actions[-1]`，即当前队列中最后一条待执行动作
-3. 用这条动作去覆盖每个 state stream 的最后一个时间步
+2. 取尚未执行的尾部动作 `remaining_actions`
+3. 用其中最后一条动作覆盖 state 的最后一个时间步
 
-当前只对“动作维度与状态维度一致”的键生效，例如：
+当前这一步是轻量近似，主要对下列键有效：
 
-- `left_arm` 或 `arm_left`
-- `right_arm` 或 `arm_right`
+- `left_arm` / `arm_left`
+- `right_arm` / `arm_right`
 - `left_gripper`
 - `right_gripper`
 
-这是一个非常轻量的 future-state-aware 近似：
+## 5. 切换点
 
-- 它不做真实动力学预测
-- 不根据推理延迟精确外推多步
-- 只是把下一次推理输入向“将来会执行到的状态”推近一点
+切换点按下面公式确定：
 
-## 6. 何时触发下一次预取
+- `swap_idx = action_horizon - frozen - 1`
 
-控制循环中有一个阈值：
+当执行到这里时，主线程会：
 
-- `action_refill_threshold`
+1. 等待后台异步结果完成
+2. 取出下一段 chunk
+3. 对当前 chunk 和下一段 chunk 做融合
+4. 切换到新 chunk
 
-当 `len(action_queue) <= action_refill_threshold` 时，如果后台当前没有正在进行的预取，就会：
+这和你给的伪代码是对齐的：
 
-1. 再读取一次最新 observation
-2. 更新 buffer
-3. 启动一次新的异步预取
+```python
+if i == action_horizon - overlap - 1:
+    future = async policy.infer(new_obs)
 
-这样可以避免：
+robot.execute(actions[i])
 
-- 动作队列完全空掉后才开始请求
-- 因等待 server 导致机器人停顿
+if i == action_horizon - frozen - 1:
+    actions = future.get()
+    break
+```
+
+## 6. 融合逻辑
+
+融合逻辑在 [\_fuse_action_chunks()]( /home/f/Isaac-GR00T/robot_control_pc/core.py#L253 )。
+
+它做的事情是：
+
+1. 取旧 chunk 的尾部 `overlap` 步
+2. 取新 chunk 的前部 `overlap` 步
+3. 在重叠区中：
+   - 最后 `frozen` 步直接保留旧 chunk 的尾部
+   - 前面的 `overlap - frozen` 步按线性权重混合
+
+混合后的新 chunk 会再跳过：
+
+- `start_offset = overlap - frozen`
+
+这样就能让切换发生在正确的时间位置，不会把已经执行过的重叠段再执行一遍。
 
 ## 7. 控制节拍
 
-主循环执行频率由：
-
-- `control_fps`
-
-控制。实现方式是：
+节拍控制仍然是软实时方式：
 
 1. 记录本步开始时间
-2. 执行动作发送
-3. 计算本步已经消耗的时间
-4. 若未达到目标周期，则 `sleep` 补足
+2. 下发动作
+3. 计算本步耗时
+4. 若未达到 `1 / control_fps`，则 `sleep`
 
-因此当前实现属于：
+因此它仍然是：
 
-- 软实时控制循环
+- 异步推理 + 软实时控制循环
 
-而不是严格硬实时 RTC。
+而不是硬实时 RTC 调度器。
 
-## 8. 关键配置参数
+## 8. 当前实现和 VLASH 的关系
 
-当前最重要的可调参数在 [example_config.yaml](/home/f/Isaac-GR00T/robot_control_pc/config/example_config.yaml)：
+当前版本借用了 VLASH 最重要的两层想法：
 
-- `control_fps`
-  - 动作执行频率
-- `open_loop_horizon`
-  - 每次从 chunk 中实际放入本地队列的步数
-- `action_refill_threshold`
-  - 队列剩余多少步时开始预取下一段
-- `point_time_from_start`
-  - 每个 `JointTrajectoryPoint` 的目标到达时间
-- `timeout_ms`
-  - 与 server 通信的超时时间
-- `reset_on_start`
-  - 启动时是否先回初始位姿
+- 后台异步推理
+- chunk 边界的 RTC 式重叠处理
 
-### 调参建议
+但它仍然不是完整 VLASH，主要差别在：
 
-如果关注稳定性：
+- 没有完整的模型内 inpainting 机制
+- 软融合是在 client 侧手工完成的
+- future-state-aware 只做了轻量前滚
+- 没有 action quantization
+- 没有严格的延迟建模和 deadline 控制
 
+## 9. 适合怎么调
+
+如果动作边界还不够顺：
+
+- 增大 `rtc_overlap`
+- 适当减小 `rtc_frozen`
+
+如果异步结果总是来不及：
+
+- 增大 `rtc_frozen`
 - 降低 `control_fps`
-- 增大 `point_time_from_start`
-- 减小 `open_loop_horizon`
+- 降低 server 推理延迟
 
-如果关注流畅性和减少停顿：
+如果动作太慢或拖：
 
-- 适当增大 `open_loop_horizon`
-- 适当增大 `action_refill_threshold`
+- 减小 `point_time_from_start`
+- 在保证稳定的前提下提高 `control_fps`
 
-如果希望反应更快：
+## 10. 一句话总结
 
-- 降低 `open_loop_horizon`
-- 结合更低的推理延迟
+当前 `robot_control_pc` 的执行逻辑是：
 
-## 9. 与原始同步版本的区别
-
-旧版同步思路大致是：
-
-1. 读 observation
-2. 同步 `get_action()`
-3. 执行前几步动作
-4. 再读 observation
-
-当前版本的区别在于：
-
-- 引入了 `action_queue`
-- 引入了后台线程异步预取
-- 不再每个 chunk 都阻塞主循环
-- 在预取时对 state 做了 future-state-aware 的近似前滚
-
-## 10. 当前实现的局限
-
-当前版本仍然不是完整 VLASH，主要局限有：
-
-- future-state projection 很粗糙
-  - 只使用 `queued_actions[-1]`
-  - 没有根据真实推理延迟外推多步
-- 只对“状态维度与动作维度一致”的键自然生效
-- 还没有 action quantization
-- 还没有更细的时间对齐和融合逻辑
-- 仍然依赖 Python 线程与 `time.sleep()`，属于软实时
-
-## 11. 适用场景
-
-当前实现更适合：
-
-- GR00T server 在另一台机器上
-- 单次推理存在明显延迟
-- 机器人希望保持连续动作而不是“推理一下停一下”
-- 关节位置型 action 为主的控制任务
-
-## 12. 一句话总结
-
-当前 `robot_control_pc` 的控制循环可以概括为：
-
-- 用本地队列持续执行动作
-- 用后台线程异步拉取下一段 action chunk
-- 用待执行动作对下一次推理的 state 做轻量 future-state-aware 前滚
-
-这就是它与 VLASH 最接近的部分。
+- 首段同步推理
+- 中段异步预取下一段
+- 在 chunk 尾部用 `overlap/frozen` 做 RTC 风格切换
+- 用软融合减少新旧 chunk 的边界突变

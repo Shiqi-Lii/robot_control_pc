@@ -22,14 +22,14 @@
 
 state 相关：
 - 关节状态：`/joint_states`
-- 夹爪状态：`/robot/api/io/state`
+- 左夹爪状态：`/gripper_left/state`（`std_msgs/msg/UInt8`）
 - 末端位姿：`/planner/left_tcp_pose` 或 `/planner/right_tcp_pose`
 - 图像：`/image_raw` ROS 2 类型 `sensor_msgs/msg/Image`
 
 action 相关：
 - 控制下发：`/arm_left_controller/joint_trajectory` 和 `/arm_right_controller/joint_trajectory`
 - 末端增量控制：`/left_servo_node/delta_twist_cmds` 和 `/right_servo_node/delta_twist_cmds`（可选）
-- 夹爪控制：`/plc/io/cmd`
+- 左夹爪控制：`/gripper_left/cmd`（UInt8 bridge）
 
 
 ## 使用方式
@@ -63,7 +63,7 @@ python -m robot_control_pc.main --config robot_control_pc/config/example_config.
 
 - 订阅左右臂 joint / gripper / ee_pose
 - 分别发布 `left_arm` / `right_arm` 到对应 `joint_trajectory`
-- 把 `left_gripper` / `right_gripper` 映射成 `Modbus` 指令发到 `/plc/io/cmd`
+- 把 `left_gripper` 发布到 `/gripper_left/cmd`（`UInt8`）
 
 程序不会自动把所有状态都塞进 observation。
 真正发给 GR00T server 的状态，由 [example_config.json] 里的 `state_keys` 决定。
@@ -106,14 +106,16 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
 修改 `config/example_config.json`：
 
 - `policy_host` / `policy_port`: 远端 server 地址。
+- `execution_mode`: `async_queue` 或 `rtc`
 - `joint_state_topic`: 文档里明确可用的状态 topic 是 `/joint_states`
 - `left_trajectory_topic` / `right_trajectory_topic`: 左右臂控制 topic
 - `reset_on_start`: 启动时是否先执行一次回初始位姿
 - `reset_duration_s`: 回初始位姿轨迹执行时长
 - `reset_left_joint_positions` / `reset_right_joint_positions`: 回初始位姿的关节角
-- `gripper_state_topic`: 夹爪状态 topic，当前支持 `interfaces/msg/Modbus`
-- `gripper_cmd_topic`: 夹爪控制 topic
-- `gripper_left_cmd_key` / `gripper_right_cmd_key`: 左右夹爪输出键
+- `left_gripper_uint8_enabled`: 是否启用左夹爪 `UInt8` bridge 控制
+- `left_gripper_cmd_topic`: 左夹爪 bridge 控制话题，默认 `/gripper_left/cmd`
+- `left_gripper_state_enabled`: 是否订阅左夹爪 bridge 状态
+- `left_gripper_state_topic`: 左夹爪 bridge 状态话题，默认 `/gripper_left/state`
 - `left_ee_pose_topic` / `right_ee_pose_topic`: 左右 TCP 位姿 topic
 - `left_joint_names` / `right_joint_names`: 要和 `joint_states` 里的关节名一致
 - `camera_keys`: 必须与模型的 `video` modality key 对齐。
@@ -128,7 +130,6 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
 - `right_arm`
 - `right_arm_velocity`
 - `left_gripper`
-- `right_gripper`
 - `left_ee_pose`
 - `right_ee_pose`
 
@@ -142,7 +143,6 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   - `delta_right_ee_pose`：长度至少 6，格式 `[dx, dy, dz, drx, dry, drz]`
 - 夹爪控制：
   - `left_gripper`
-  - `right_gripper`
 
 控制切换规则（按每只手臂独立）：
 
@@ -176,14 +176,13 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
 - `right_arm`
 - `right_arm_velocity`
 - `left_gripper`
-- `right_gripper`
 - `left_ee_pose`
 - `right_ee_pose`
 
-例如只传双臂关节和夹爪：
+例如只传左臂关节和左夹爪：
 
 ```json
-"state_keys": ["left_arm", "right_arm", "left_gripper", "right_gripper"]
+"state_keys": ["left_arm", "left_gripper"]
 ```
 
 `YsRos2RobotController.get_observation()` 只会生成 `state_keys` 里列出来的键。
@@ -204,17 +203,6 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   采集程序保存字段为 `name`, `q`, `dq`, `effort`。
   现在控制端也是按 `name -> position/velocity` 重排左右臂关节，这个是正确的。
 
-- `gripper_state`
-  依据：
-  [state_spec.yaml]
-  和 [recorder_node.py]
-  采集程序订阅的是 `/robot/api/io/state`，消息类型 `interfaces/msg/Modbus`，状态键是：
-  `an_out_d9710` / `an_out_d9711`
-  并映射：
-  `2 -> open -> 1.0`
-  `1 -> closed -> 0.0`
-  现在控制端读取方式与这个逻辑一致。
-
 - `ee_pose`
   依据：
   [state_spec.yaml]和 [recorder_node.py]
@@ -227,25 +215,12 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args \
   现在控制端输出 `left_ee_pose/right_ee_pose` 也是同样的 7 维结构。
 
 ## 夹爪控制
-- 采集程序记录夹爪状态用的是 `/robot/api/io/state`
-- 但现有控制 GUI 代码里，夹爪控制发布到的是 `/plc/io/cmd`
+当前仅保留 `/home/f/ysrobot_ws2/run_gripper_global.sh` 对应的左夹爪 `UInt8` bridge：
 
-依据是：
-[gui_publisher.py]
+- 下发命令：`/gripper_left/cmd`（`std_msgs/UInt8`）
+- 读取状态：`/gripper_left/state`（`std_msgs/UInt8`）
 
-里面的命令键是：
+动作映射规则：
 
-- 左夹爪：`an_out_clamp`
-- 右夹爪：`an_out_clamp_r`
-
-命令值是：
-
-- `2` 表示打开
-- `1` 表示关闭
-
-所以当前 `robot_control_pc` 已经按这套控制逻辑实现：
-
-- 读取状态：`/robot/api/io/state`
-- 下发命令：`/plc/io/cmd`
-
-如果现场实际使用的 PLC 接口不是 `/plc/io/cmd`，只需要改配置文件里的 `gripper_cmd_topic`、`gripper_left_cmd_key`、`gripper_right_cmd_key`。
+- `left_gripper > 0.5` 时发送 `1`（close）
+- `left_gripper <= 0.5` 时发送 `0`（open）

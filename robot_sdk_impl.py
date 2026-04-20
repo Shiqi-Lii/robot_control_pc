@@ -120,16 +120,12 @@ class YsRos2Config:
     left_trajectory_topic: str
     right_trajectory_topic: str
     joint_state_topic: str = "/joint_states"
-    gripper_state_enabled: bool = False
-    gripper_state_topic: str = "/robot/api/io/state"
-    gripper_cmd_enabled: bool = True
-    gripper_cmd_topic: str = "/plc/io/cmd"
-    gripper_left_key: str = "an_out_d9710"
-    gripper_right_key: str = "an_out_d9711"
-    gripper_left_cmd_key: str = "an_out_clamp"
-    gripper_right_cmd_key: str = "an_out_clamp_r"
-    gripper_open_value: int = 2
-    gripper_closed_value: int = 1
+    left_gripper_uint8_enabled: bool = False
+    left_gripper_cmd_topic: str = "/gripper_left/cmd"
+    left_gripper_state_enabled: bool = False
+    left_gripper_state_topic: str = "/gripper_left/state"
+    left_gripper_open_cmd_value: int = 0
+    left_gripper_closed_cmd_value: int = 1
     gripper_default_value: float = 0.5
     left_ee_pose_enabled: bool = False
     left_ee_pose_topic: str = "/planner/left_tcp_pose"
@@ -165,11 +161,11 @@ class YsRos2RobotController(RobotInterface):
         self._node = None
         self._left_trajectory_pub = None
         self._right_trajectory_pub = None
-        self._gripper_cmd_pub = None
+        self._left_gripper_uint8_cmd_pub = None
         self._left_delta_twist_pub = None
         self._right_delta_twist_pub = None
         self._latest_joint_state = None
-        self._latest_gripper_state = None
+        self._latest_left_gripper_uint8_state = None
         self._latest_left_ee_pose = None
         self._latest_right_ee_pose = None
         self._wants_left_ee_delta = False
@@ -179,10 +175,10 @@ class YsRos2RobotController(RobotInterface):
         try:
             import rclpy
             from geometry_msgs.msg import PoseStamped, TwistStamped
-            from interfaces.msg import Modbus
             from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
             from sensor_msgs.msg import JointState
+            from std_msgs.msg import UInt8
             from std_srvs.srv import Trigger
             from trajectory_msgs.msg import JointTrajectory
         except ImportError as exc:
@@ -209,10 +205,10 @@ class YsRos2RobotController(RobotInterface):
             self.config.right_trajectory_topic,
             10,
         )
-        if self.config.gripper_cmd_enabled:
-            self._gripper_cmd_pub = self._node.create_publisher(
-                Modbus,
-                self.config.gripper_cmd_topic,
+        if self.config.left_gripper_uint8_enabled:
+            self._left_gripper_uint8_cmd_pub = self._node.create_publisher(
+                UInt8,
+                self.config.left_gripper_cmd_topic,
                 10,
             )
 
@@ -237,11 +233,11 @@ class YsRos2RobotController(RobotInterface):
             self._on_joint_state,
             100,
         )
-        if self.config.gripper_state_enabled:
+        if self.config.left_gripper_state_enabled:
             self._node.create_subscription(
-                Modbus,
-                self.config.gripper_state_topic,
-                self._on_gripper_state,
+                UInt8,
+                self.config.left_gripper_state_topic,
+                self._on_left_gripper_uint8_state,
                 100,
             )
         if self.config.left_ee_pose_enabled:
@@ -267,8 +263,8 @@ class YsRos2RobotController(RobotInterface):
         print(
             "YS ROS2 controller connected with "
             f"joint_state_topic={self.config.joint_state_topic}, "
-            f"gripper_topic={self.config.gripper_state_topic if self.config.gripper_state_enabled else 'disabled'}, "
-            f"gripper_cmd_topic={self.config.gripper_cmd_topic if self.config.gripper_cmd_enabled else 'disabled'}, "
+            f"left_gripper_uint8_cmd_topic={self.config.left_gripper_cmd_topic if self.config.left_gripper_uint8_enabled else 'disabled'}, "
+            f"left_gripper_uint8_state_topic={self.config.left_gripper_state_topic if self.config.left_gripper_state_enabled else 'disabled'}, "
             f"left_ee_pose_topic={self.config.left_ee_pose_topic if self.config.left_ee_pose_enabled else 'disabled'}, "
             f"right_ee_pose_topic={self.config.right_ee_pose_topic if self.config.right_ee_pose_enabled else 'disabled'}"
         )
@@ -337,8 +333,8 @@ class YsRos2RobotController(RobotInterface):
     def _on_joint_state(self, msg) -> None:
         self._latest_joint_state = msg
 
-    def _on_gripper_state(self, msg) -> None:
-        self._latest_gripper_state = msg
+    def _on_left_gripper_uint8_state(self, msg) -> None:
+        self._latest_left_gripper_uint8_state = msg
 
     def _on_left_ee_pose(self, msg) -> None:
         self._latest_left_ee_pose = msg
@@ -379,29 +375,22 @@ class YsRos2RobotController(RobotInterface):
         return np.asarray(velocities, dtype=np.float32)
 
     def _extract_gripper_value(self, side: str) -> np.ndarray:
-        if not self.config.gripper_state_enabled or self._latest_gripper_state is None:
-            return np.asarray([self.config.gripper_default_value], dtype=np.float32)
+        if side != "left":
+            raise KeyError("Only left_gripper is supported in UInt8 bridge mode.")
 
-        target_key = (
-            self.config.gripper_left_key
-            if side == "left"
-            else self.config.gripper_right_key
-        )
-        io_map = {
-            key: value
-            for key, value in zip(
-                self._latest_gripper_state.in_out,
-                self._latest_gripper_state.values,
-            )
-        }
-        raw_value = io_map.get(target_key)
-        if raw_value == self.config.gripper_open_value:
-            normalized = 1.0
-        elif raw_value == self.config.gripper_closed_value:
-            normalized = 0.0
-        else:
-            normalized = self.config.gripper_default_value
-        return np.asarray([normalized], dtype=np.float32)
+        if side == "left" and self.config.left_gripper_state_enabled:
+            if self._latest_left_gripper_uint8_state is None:
+                return np.asarray([self.config.gripper_default_value], dtype=np.float32)
+            raw_value = int(self._latest_left_gripper_uint8_state.data)
+            if raw_value == self.config.left_gripper_open_cmd_value:
+                normalized = float(self.config.left_gripper_open_cmd_value)
+            elif raw_value == self.config.left_gripper_closed_cmd_value:
+                normalized = float(self.config.left_gripper_closed_cmd_value)
+            else:
+                normalized = self.config.gripper_default_value
+            return np.asarray([normalized], dtype=np.float32)
+
+        return np.asarray([self.config.gripper_default_value], dtype=np.float32)
 
     def _extract_ee_pose(self, side: str) -> np.ndarray:
         latest_pose = self._latest_left_ee_pose if side == "left" else self._latest_right_ee_pose
@@ -499,7 +488,7 @@ class YsRos2RobotController(RobotInterface):
             elif key == "left_gripper":
                 observation[key] = self._extract_gripper_value("left")
             elif key == "right_gripper":
-                observation[key] = self._extract_gripper_value("right")
+                raise KeyError("right_gripper is not supported in UInt8 bridge mode.")
             elif key == "left_ee_pose":
                 observation[key] = self._extract_ee_pose("left")
             elif key == "right_ee_pose":
@@ -536,11 +525,11 @@ class YsRos2RobotController(RobotInterface):
                 joint_names=self.config.right_joint_names,
                 positions=np.asarray(action["right_arm"], dtype=np.float64).reshape(-1),
             )
-        if self.config.gripper_cmd_enabled:
-            if "left_gripper" in action:
-                self._publish_gripper_command("left", float(np.asarray(action["left_gripper"]).reshape(-1)[0]))
-            if "right_gripper" in action:
-                self._publish_gripper_command("right", float(np.asarray(action["right_gripper"]).reshape(-1)[0]))
+        if "left_gripper" in action:
+            left_value = float(np.asarray(action["left_gripper"]).reshape(-1)[0])
+            self._publish_left_gripper_uint8_command(left_value)
+        if "right_gripper" in action:
+            raise KeyError("right_gripper action is not supported in UInt8 bridge mode.")
 
     def _publish_joint_trajectory(
         self,
@@ -572,26 +561,22 @@ class YsRos2RobotController(RobotInterface):
         msg.points = [point]
         publisher.publish(msg)
 
-    def _publish_gripper_command(self, side: str, normalized_value: float) -> None:
-        from interfaces.msg import Modbus
+    def _publish_left_gripper_uint8_command(self, normalized_value: float) -> None:
+        from std_msgs.msg import UInt8
 
-        if self._gripper_cmd_pub is None:
+        if self._left_gripper_uint8_cmd_pub is None:
             return
 
+        # Policy-to-command rule for left gripper bridge:
+        # value > 0.5 -> close(1), otherwise open(0)
         raw_value = (
-            self.config.gripper_open_value
-            if normalized_value >= 0.5
-            else self.config.gripper_closed_value
+            self.config.left_gripper_closed_cmd_value
+            if normalized_value > 0.5
+            else self.config.left_gripper_open_cmd_value
         )
-        key = (
-            self.config.gripper_left_cmd_key
-            if side == "left"
-            else self.config.gripper_right_cmd_key
-        )
-        msg = Modbus()
-        msg.in_out = [key]
-        msg.values = [int(raw_value)]
-        self._gripper_cmd_pub.publish(msg)
+        msg = UInt8()
+        msg.data = int(raw_value)
+        self._left_gripper_uint8_cmd_pub.publish(msg)
 
 
 def build_cameras_from_config(config: dict[str, Any]) -> dict[str, CameraInterface]:
@@ -617,16 +602,12 @@ def build_robot_from_config(config: dict[str, Any]) -> RobotInterface:
             "right_trajectory_topic", "/arm_right_controller/joint_trajectory"
         ),
         joint_state_topic=config.get("joint_state_topic", "/joint_states"),
-        gripper_state_enabled=config.get("gripper_state_enabled", False),
-        gripper_state_topic=config.get("gripper_state_topic", "/robot/api/io/state"),
-        gripper_cmd_enabled=config.get("gripper_cmd_enabled", True),
-        gripper_cmd_topic=config.get("gripper_cmd_topic", "/plc/io/cmd"),
-        gripper_left_key=config.get("gripper_left_key", "an_out_d9710"),
-        gripper_right_key=config.get("gripper_right_key", "an_out_d9711"),
-        gripper_left_cmd_key=config.get("gripper_left_cmd_key", "an_out_clamp"),
-        gripper_right_cmd_key=config.get("gripper_right_cmd_key", "an_out_clamp_r"),
-        gripper_open_value=int(config.get("gripper_open_value", 2)),
-        gripper_closed_value=int(config.get("gripper_closed_value", 1)),
+        left_gripper_uint8_enabled=bool(config.get("left_gripper_uint8_enabled", False)),
+        left_gripper_cmd_topic=str(config.get("left_gripper_cmd_topic", "/gripper_left/cmd")),
+        left_gripper_state_enabled=bool(config.get("left_gripper_state_enabled", False)),
+        left_gripper_state_topic=str(config.get("left_gripper_state_topic", "/gripper_left/state")),
+        left_gripper_open_cmd_value=int(config.get("left_gripper_open_cmd_value", 0)),
+        left_gripper_closed_cmd_value=int(config.get("left_gripper_closed_cmd_value", 1)),
         gripper_default_value=float(config.get("gripper_default_value", 0.5)),
         left_ee_pose_enabled=config.get("left_ee_pose_enabled", False),
         left_ee_pose_topic=config.get("left_ee_pose_topic", "/planner/left_tcp_pose"),
