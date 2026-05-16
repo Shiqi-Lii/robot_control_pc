@@ -277,6 +277,8 @@ class Gr00tRobotControlClient:
                 action_value = np.asarray(future_action[action_key], dtype=np.float32).reshape(-1)
                 if action_value.size != state_value.shape[-1]:
                     continue
+                if "gripper" in state_key and action_value.size == 1:
+                    action_value[0] = 1.0 if float(action_value[0]) >= 0.5 else 0.0
                 state_value[0, -1, :] = action_value
                 break
 

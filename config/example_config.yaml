@@ -1,10 +1,10 @@
 policy_host: 172.22.1.127
 policy_port: 5555
 timeout_ms: 15000           # 通信时的超时时间
-control_fps: 30           # 机器人执行动作的目标频率
+control_fps: 100           # 机器人执行动作的目标频率
 open_loop_horizon: 16     # 决定每次从 server 返回的 action chunk 里，实际执行多少步
 max_steps: 0                # 控制程序最多执行多少个动作步，0 表示不设上限，一直跑
-point_time_from_start: 0.01 # 每次发出去的轨迹点都告诉控制器几秒到达
+point_time_from_start: 0.005 # 每次发出去的轨迹点都告诉控制器几秒到达
 
 # ===指令===========================================================
 # language_instruction: show the left hand in front of the body
@@ -18,17 +18,17 @@ language_instruction: pick up the bottle and place it in the blue box
 execution_mode: async_queue  # async_queue 或 rtc
 
 # 仅 async_queue 模式使用
-action_refill_threshold: 4  # 动作队列低于该值时立即向 server 拉取新 chunk
+action_refill_threshold: 6  # 动作队列低于该值时立即向 server 拉取新 chunk
 
 # 仅 rtc 模式使用
-rtc_overlap: 5       
-rtc_frozen: 2
+rtc_overlap: 8       
+rtc_frozen: 4
 # ================================================================        
 
 
 # ===归位设置=======================================================
 reset_on_start: true        # 是否在启动时调用 robot.reset()
-reset_duration_s: 2.0       # reset 的时间
+reset_duration_s: 4.0       # reset 的时间
 reset_left_joint_positions:  [-0.2,-0.2, 0.0, -0.5, 0.0, -0.8, 0.5] # 机器人初始位置
 # reset_left_joint_positions:  [0.0, 0.0, 0.0, -0.5s, 0.0, 0.0, 0.0] # 机器人初始位置
 # reset_left_joint_positions:  [0.0, 0.0, 0.0, -0.0, 0.0, 0.0, 0.0] # 机器人初始位置
